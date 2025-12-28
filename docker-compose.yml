@@ -1,0 +1,46 @@
+services:
+  # --- CEREBRO: El motor de IA Local ---
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama_brain
+    # Acceso a la GPU RTX 3050
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      - OLLAMA_NUM_GPU=999
+    volumes:
+      - ollama_storage:/root/.ollama
+    networks:
+      - trading_net
+    restart: unless-stopped
+
+  # --- EJECUTOR: Tu Bot de Python ---
+  trading_bot:
+    build: .
+    depends_on:
+      - ollama
+    environment:
+      - BINANCE_API_KEY=${BINANCE_API_KEY}
+      - BINANCE_API_SECRET=${BINANCE_API_SECRET}
+      - SYMBOL=${SYMBOL:-BTCUSDT}
+      - OLLAMA_BASE_URL=http://ollama:11434
+    volumes:
+      - ./bot_logic:/app/bot_logic
+      - trading_data:/app/shared
+    command: python -u bot_logic/main.py
+    tty: true
+    networks:
+      - trading_net
+
+networks:
+  trading_net:
+    driver: bridge
+
+volumes:
+  ollama_storage:
+  trading_data:

@@ -1,0 +1,7 @@
+python-binance
+pandas-ta
+python-binance
+python-dotenv
+websockets
+pandas
+pandas-ta
