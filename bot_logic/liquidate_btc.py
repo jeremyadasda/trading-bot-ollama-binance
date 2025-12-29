@@ -4,7 +4,7 @@ from binance.client import Client
 from dotenv import load_dotenv
 
 def sell_all_btc():
-    print("--- 🚀 LIQUIDATING BTC FOR USDT TESTING ---")
+    print("---  LIQUIDATING BTC FOR USDT TESTING ---")
     load_dotenv()
     
     api_key = os.getenv('BINANCE_API_KEY')
@@ -24,7 +24,7 @@ def sell_all_btc():
         print(f"You have: {asset_balance} {asset}")
         
         if asset_balance < 0.0001:
-            print("❌ Nothing to sell! Your BTC balance is too low.")
+            print(" Nothing to sell! Your BTC balance is too low.")
             return
 
         # 2. Market Sell EVERYTHING
@@ -38,17 +38,17 @@ def sell_all_btc():
             quantity=round(asset_balance, 5) 
         )
         
-        print(f"✅ SUCCESS! Sold holdings for USDT.")
+        print(f" SUCCESS! Sold holdings for USDT.")
         print(f"Order ID: {order['orderId']}")
         
         # 3. Final Balance Check
         time.sleep(1)
         new_usdt = float(client.get_asset_balance(asset='USDT')['free'])
-        print(f"\n💰 NEW BALANCE: ${new_usdt:,.2f} USDT")
+        print(f"\n NEW BALANCE: ${new_usdt:,.2f} USDT")
         print("The bot now has plenty of 'fuel' for high-frequency trading!")
         
     except Exception as e:
-        print(f"\n❌ FAILED: {e}")
+        print(f"\n FAILED: {e}")
 
 if __name__ == "__main__":
     sell_all_btc()

@@ -164,109 +164,130 @@ def get_wallet_info(client, symbol):
             "text": f"WALLET ERROR: {e}"
         }
 
-def get_market_summary(client, symbol):
+def get_multi_timeframe_analysis(client, symbol):
     if not client:
-        return "Market data unavailable"
+        return "Market data unavailable", {}
+    
+    timeframes = {
+        "15m": Client.KLINE_INTERVAL_15MINUTE,
+        "1h": Client.KLINE_INTERVAL_1HOUR,
+        "4h": Client.KLINE_INTERVAL_4HOUR
+    }
+    
+    full_summary = "--- Multi-Timeframe Analysis ---"
+    analysis_data = {}
+    
+    for tf_name, tf_interval in timeframes.items():
+        try:
+            klines = client.get_klines(symbol=symbol, interval=tf_interval, limit=100)
+            df = pd.DataFrame(klines, columns=['ts', 'open', 'high', 'low', 'close', 'vol', 'close_ts', 'qav', 'num_trades', 'taker_base', 'taker_quote', 'ignore'])
+            df['close'] = df['close'].astype(float)
+            
+            # Indicators
+            df['RSI'] = ta.rsi(df['close'], length=14)
+            df['EMA_20'] = ta.ema(df['close'], length=20)
+            df['EMA_50'] = ta.ema(df['close'], length=50)
+            
+            last = df.iloc[-1]
+            price = last['close']
+            rsi = last['RSI'] if 'RSI' in last else 50
+            ema20 = last['EMA_20'] if 'EMA_20' in last else price
+            ema50 = last['EMA_50'] if 'EMA_50' in last else price
+            
+            trend = "BULLISH" if price > ema20 > ema50 else "BEARISH" if price < ema20 < ema50 else "SIDEWAYS"
+            
+            full_summary += f"\n[{tf_name} TF] Trend: {trend} | RSI: {rsi:.2f}"
+            analysis_data[tf_name] = {"rsi": rsi}
+            
+        except Exception as e:
+            full_summary += f"\n[{tf_name} TF] Error: {e}"
+            
+    return full_summary, analysis_data
+
+def get_order_book_snapshot(client, symbol):
+    if not client:
+        return "Order book data unavailable"
     try:
-        klines = client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1HOUR, limit=100)
-        df = pd.DataFrame(klines, columns=['ts', 'open', 'high', 'low', 'close', 'vol', 'close_ts', 'qav', 'num_trades', 'taker_base', 'taker_quote', 'ignore'])
-        df['close'] = df['close'].astype(float)
+        depth = client.get_order_book(symbol=symbol, limit=10)
         
-        # Indicators
-        df['RSI'] = ta.rsi(df['close'], length=14)
-        df['EMA_20'] = ta.ema(df['close'], length=20)
-        df['EMA_50'] = ta.ema(df['close'], length=50)
+        bid_volume = sum([float(bid[1]) for bid in depth['bids']])
+        ask_volume = sum([float(ask[1]) for bid in depth['asks']])
         
-        # ADDED: Bollinger Bands
-        bbands = ta.bbands(df['close'], length=20, std=2)
-        if bbands is not None:
-            df = pd.concat([df, bbands], axis=1)
+        ratio = bid_volume / ask_volume if ask_volume > 0 else float('inf')
         
-        # ADDED: MACD
-        macd = ta.macd(df['close'])
-        if macd is not None:
-            df = pd.concat([df, macd], axis=1)
+        pressure = "BUY" if ratio > 1.1 else "SELL" if ratio < 0.9 else "NEUTRAL"
         
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
-        
-        # Robust Column Discovery
-        def get_col(df, prefix):
-            cols = [c for c in df.columns if c.startswith(prefix)]
-            return cols[0] if cols else None
-
-        bbu_col = get_col(df, 'BBU')
-        bbl_col = get_col(df, 'BBL')
-        bbm_col = get_col(df, 'BBM')
-        macd_col = get_col(df, 'MACD_12_26_9')
-        signal_col = get_col(df, 'MACDs_12_26_9')
-        
-        price = last['close']
-        rsi = last['RSI'] if 'RSI' in last else 50
-        ema20 = last['EMA_20'] if 'EMA_20' in last else price
-        ema50 = last['EMA_50'] if 'EMA_50' in last else price
-        
-        # Indicator Values with extraction
-        curr_macd = last[macd_col] if macd_col else 0
-        curr_signal = last[signal_col] if signal_col else 0
-        curr_bbu = last[bbu_col] if bbu_col else price * 1.02
-        curr_bbl = last[bbl_col] if bbl_col else price * 0.98
-        curr_bbm = last[bbm_col] if bbm_col else price
-        
-        # Aggressive Trend Detection
-        trend = "STRONG BULLISH" if price > ema20 > ema50 and curr_macd > curr_signal else \
-                "STRONG BEARISH" if price < ema20 < ema50 and curr_macd < curr_signal else \
-                "SIDEWAYS/STABLE"
-        
-        volatility = "HIGH" if (curr_bbu - curr_bbl) / curr_bbm > 0.05 else "LOW"
-        
-        summary = (
-            f"--- Aggressive Market Snapshot ({symbol}) ---\n"
-            f"Price: {price} | RSI: {rsi:.2f}\n"
-            f"MACD: {curr_macd:.2f} | Signal: {curr_signal:.2f}\n"
-            f"BBands: Upper {curr_bbu:.2f} / Lower {curr_bbl:.2f}\n"
-            f"Trend: {trend} | Volatility: {volatility}\n"
-            f"1h Price Change: {((last['close'] - prev['close']) / prev['close'] * 100):.2f}%"
-        )
-        return summary
+        return f"Bid/Ask Volume Ratio: {ratio:.2f}:1 | Immediate Pressure: {pressure}"
     except Exception as e:
-        return f"Error calculating technical indicators: {e}"
+        return f"Could not get order book: {e}"
 
-def ask_ai_opinion(market_summary, wallet_text):
-    # Dynamic Context-Aware Prompt
+def get_fear_and_greed_index():
+    try:
+        r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=10)
+        r.raise_for_status()
+        data = r.json()['data'][0]
+        value = int(data['value'])
+        classification = data['value_classification']
+        return f"Value: {value} ({classification})"
+    except Exception as e:
+        return f"Could not fetch: {e}"
+
+def ask_ai_opinion(market_summary, wallet_text, trade_history, order_book, sentiment, live_data):
+    trade_summary = "No recent trades."
+    if trade_history:
+        trade_summary = "Recent Trades:\n"
+        for trade in trade_history[-5:]:
+            trade_summary += f"- {trade['type']} @ ${trade['price']:.2f} for ${trade['amount']:.2f}\n"
+
+    live_data_summary = f"Live Price: {live_data.get('price', 'N/A')}"
+
     prompt = f"""
-    ROLE: You are an Autonomous Hedge Fund Manager. 
-    You must REGULATE your persona and your trade intensity based on the market context provided.
-    
-    SYSTEM STATE:
+    ROLE: You are a sophisticated, multi-dimensional crypto trading analyst. Your goal is to maximize profit by synthesizing multiple data points into a coherent trading strategy.
+
+    You must follow a strict Chain-of-Thought reasoning process.
+
+    --- DATA STREAMS ---
+    1. CURRENT PORTFOLIO:
     {wallet_text}
+    {trade_summary}
+
+    2. LIVE DATA (Current Moment):
+    - {live_data_summary}
+    - Order Book Snapshot: {order_book}
     
-    DATA FEED:
+    3. MARKET SENTIMENT:
+    - Fear & Greed Index: {sentiment}
+
+    4. TECHNICAL ANALYSIS:
     {market_summary}
-    
-    TASKS & RULES:
-    1. CONTEXT ANALYSIS: Determine if the market is trending, ranging, or volatile.
-    2. PERSONA REGULATION: Choose a persona (AGGRESSIVE, CONSERVATIVE, HEDGER, SCALPER).
-    3. BALANCE AWARENESS (CRITICAL):
-       - If USDT is below $15.0, DO NOT SUGGEST A BUY. You should either SELL a portion of your holdings to get USDT or HOLD.
-       - If you have zero holdings of an asset, you cannot SELL it.
-       - Your goal is to keep a healthy balance of USDT for future opportunities.
-    4. QUANTITY REGULATION: Decide WHAT PERCENTAGE of your available balance to use (0.1 to 1.0).
-    5. SPECULATION BIAS: You are in 'TRY HARD' mode. Minimize 'HOLD' decisions unless absolutely necessary. 
-    
-    RESPONSE FORMAT (JSON ONLY):
+
+    --- REASONING PROCESS (Chain-of-Thought) ---
+    1.  **Synthesize Macro View (4h):** What is the major trend direction on the 4-hour chart? Are we in a larger uptrend or downtrend?
+    2.  **Identify Session Trend (1h):** What is the trend for the current trading session on the 1-hour chart? Does it align with the macro view?
+    3.  **Pinpoint Entry/Exit (15m):** What is the immediate, short-term trend on the 15-minute chart? Is it overbought (RSI > 70) or oversold (RSI < 30)?
+    4.  **Check for Divergences:** Compare the timeframes. Is there a divergence (e.g., 4h is bullish, but 15m is bearish and overbought)? Also, compare live price action to indicators.
+    5.  **Factor in Sentiment & Order Book:** How do the Fear & Greed Index and the order book pressure influence the decision? Does strong buying pressure justify entering an overbought market? Does extreme greed suggest a correction is coming?
+    6.  **Propose & Critique Plan:** Based on the synthesis of all data, propose a primary action. Then, critique it. What are the risks? What is the alternative? (e.g., "The macro trend is bullish, but the 15m chart is overbought and F&G is at 'Extreme Greed'. Buying now is risky. A better plan might be to wait for a pullback to the 15m 20-EMA.").
+    7.  **Final Decision:** State your final, synthesized decision (BUY, SELL, or HOLD) and the quantity percentage.
+
+    --- CRITICAL RULES ---
+    - **Minimum Trade:** Must be at least $10 USDT.
+    - **BUY Rule:** DO NOT BUY if USDT balance is < $15.
+    - **SELL Rule:** DO NOT SELL if you have zero holdings of the asset.
+
+    --- RESPONSE FORMAT (JSON ONLY) ---
     {{
-        "reasoning": "Explain why this persona and quantity are best for this specific context",
-        "decision": "BUY", "SELL", or "HOLD",
-        "quantity_pct": 0.5
+      "reasoning": "CHAIN-OF-THOUGHT ANALYSIS: [Your full, step-by-step reasoning process here, following the 7 steps above]",
+      "decision": "BUY", "SELL", or "HOLD",
+      "quantity_pct": 0.5
     }}
     """
     
-    print(f"Running context-aware analysis with {MODEL_NAME}...")
+    print(f"Running multi-dimensional analysis with {MODEL_NAME}...")
     try:
         options = {
             "temperature": 0.7,
-            "num_predict": 300,
+            "num_predict": 700,
             "num_ctx": 4096
         }
         payload = {
@@ -276,19 +297,17 @@ def ask_ai_opinion(market_summary, wallet_text):
             "format": "json",
             "options": options
         }
-        r = requests.post(OLLAMA_GENERATE_URL, json=payload, timeout=70)
+        r = requests.post(OLLAMA_GENERATE_URL, json=payload, timeout=120)
         r.raise_for_status()
         
         res = r.json().get('response', '')
         
         data = json.loads(res)
-        persona = data.get('persona', 'BALANCED').upper()
         decision = data.get('decision', 'HOLD').upper()
         quantity = float(data.get('quantity_pct', 1.0))
         reasoning = data.get('reasoning', '')
         
-        print(f"\n--- AI CONTEXT ANALYSIS ---\nPERSONA: {persona}\nQUANTITY: {quantity*100:.0f}%\nREASONING: {reasoning}\n--------------------------")
-        return decision, reasoning, persona, quantity
+        return decision, reasoning, "MULTI_DIM", quantity
     except Exception as e:
         print(f"ERROR: AI Brain failed to regulate: {e}")
         return "HOLD", str(e), "ERROR", 0.0
@@ -296,11 +315,9 @@ def ask_ai_opinion(market_summary, wallet_text):
 def _get_lot_size_precision(step_size_str: str) -> int:
     """Calculates the number of decimal places for a given step size."""
     if '.' in step_size_str:
-        # Find the position of the first '1' after the decimal point
         try:
             return step_size_str.index('1') - step_size_str.index('.')
         except ValueError:
-             # Handle cases like "0.00000000"
             return len(step_size_str.split('.')[1])
     return 0
 
@@ -316,10 +333,9 @@ def execute_trade(client, symbol, decision, quantity_pct=1.0):
     asset = symbol.replace('USDT', '')
     q_pct = max(0.1, min(1.0, quantity_pct))
     
-    # 1. Get current price for calculations
-    price = 45000.0 # Use a fallback price
+    price = 45000.0
     try:
-        if client: # If in REAL mode
+        if client:
             price = float(client.get_symbol_ticker(symbol=symbol)['price'])
     except Exception as e:
         print(f"Warning: Could not fetch real-time price for trade. Using fallback. Error: {e}", flush=True)
@@ -345,23 +361,20 @@ def execute_trade(client, symbol, decision, quantity_pct=1.0):
             usdt_balance = float(client.get_asset_balance(asset='USDT')['free'])
             buy_amount_usdt = usdt_balance * q_pct
             
-            print(f"DEBUG: Attempting BUY. Available USDT: {usdt_balance}, Calc Amount: {buy_amount_usdt}", flush=True)
             if buy_amount_usdt >= 10.0:
                 print(f"Executing BUY order using {q_pct*100:.0f}% of USDT (${buy_amount_usdt:.2f})...", flush=True)
                 order = client.create_order(symbol=symbol, side=SIDE_BUY, type=ORDER_TYPE_MARKET, quoteOrderQty=round(buy_amount_usdt, 2))
                 print(f"BUY Success: {order['orderId']}", flush=True)
                 trade_history.append({"time": time.strftime('%H:%M:%S'), "type": "BUY", "price": price, "amount": buy_amount_usdt})
             else:
-                print(f"SKIPPED BUY: Amount ${buy_amount_usdt:.2f} is below Binance minimum ($10). Check Testnet balance.", flush=True)
+                print(f"SKIPPED BUY: Amount ${buy_amount_usdt:.2f} is below Binance minimum ($10).", flush=True)
                 
         elif decision == "SELL":
             asset_balance = float(client.get_asset_balance(asset=asset)['free'])
             sell_amount_asset = asset_balance * q_pct
             sell_val_usd = sell_amount_asset * price
             
-            print(f"DEBUG: Attempting SELL. Available {asset}: {asset_balance}, Value: ${sell_val_usd:.2f}", flush=True)
             if sell_val_usd >= 10.0:
-                # --- FIX: Adhere to LOT_SIZE filter ---
                 try:
                     symbol_info = client.get_symbol_info(symbol)
                     lot_size_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
@@ -374,20 +387,16 @@ def execute_trade(client, symbol, decision, quantity_pct=1.0):
                     
                     adjusted_quantity = _format_quantity(sell_amount_asset, precision)
                     
-                    print(f"DEBUG: Original Qty: {sell_amount_asset}, Adjusted Qty (precision {precision}): {adjusted_quantity}", flush=True)
-
                     if adjusted_quantity <= 0:
-                         print(f"SKIPPED SELL: Adjusted quantity {adjusted_quantity} is too small after applying LOT_SIZE filter.", flush=True)
+                         print(f"SKIPPED SELL: Adjusted quantity {adjusted_quantity} is too small.", flush=True)
                          return
 
                     print(f"Executing SELL order using {q_pct*100:.0f}% of holdings (~${sell_val_usd:.2f})...", flush=True)
                     order = client.create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_MARKET, quantity=adjusted_quantity)
                     print(f"SELL Success: {order['orderId']}", flush=True)
                     trade_history.append({"time": time.strftime('%H:%M:%S'), "type": "SELL", "price": price, "amount": sell_val_usd})
-
                 except Exception as e:
                     print(f"ERROR during SELL order pre-check: {e}", flush=True)
-                # --- END FIX ---
             else:
                 print(f"SKIPPED SELL: Value ${sell_val_usd:.2f} is below Binance minimum ($10).", flush=True)
         else:
@@ -411,21 +420,18 @@ def get_live_ticker(client, symbol):
         print(f"Error fetching live ticker: {e}")
         return {}
 
-# Globals for the dual-loop and history
 last_brain_run = 0
 current_decision = "HOLD"
 current_reasoning = "Initializing Brain..."
 current_persona = "BALANCED"
 current_quantity = 0.0
 initial_worth = None
-trade_history = []  # List of {"time": str, "type": str, "price": float, "amount": float}
-mock_portfolio = {"usdt": 1000.0, "asset": 0.0, "asset_name": "BTC"} # Mock for paper trading
+trade_history = []
+mock_portfolio = {"usdt": 1000.0, "asset": 0.0, "asset_name": "BTC"}
+price_history = []
+profit_history = []
 
-# History tracking
-price_history = []  # List of {"time": str, "price": float}
-profit_history = [] # List of {"time": str, "worth": float}
-
-def print_status_update(market_summary, wallet_info, decision, reasoning, persona="NEUTRAL", quantity=0.0, live_data=None):
+def print_status_update(market_summary, wallet_info, decision, reasoning, persona, quantity, live_data, order_book, sentiment):
     global price_history, profit_history, initial_worth
     try:
         now = time.strftime('%H:%M:%S')
@@ -433,53 +439,39 @@ def print_status_update(market_summary, wallet_info, decision, reasoning, person
         current_price = float(live_data.get('price', 0)) if live_data else 0
         total_worth = float(wallet_info.get('total_usd', 0))
         
-        if initial_worth is None:
-            initial_worth = total_worth
+        if initial_worth is None: initial_worth = total_worth
             
-        if current_price > 0:
-            price_history.append({"time": now, "price": current_price})
+        if current_price > 0: price_history.append({"time": now, "price": current_price})
         profit_history.append({"time": now, "worth": total_worth})
         
         if len(price_history) > 100: price_history.pop(0)
         if len(profit_history) > 100: profit_history.pop(0)
 
-        connection_mode = "REAL" if os.getenv('BINANCE_API_KEY') and "REAL" in wallet_info.get('text', '') else "SIMULATED"
+        connection_mode = "REAL" if os.getenv('BINANCE_API_KEY') else "SIMULATED"
         symbol = os.getenv('SYMBOL', 'BTCUSDT')
 
-        print("\n" + "="*50)
+        # This is the main print block
+        print("\n" + "="*80)
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] - TRADING BOT STATUS ({connection_mode} MODE)")
-        print("="*50)
-        print(f"SYMBOL: {symbol}")
-        if live_data:
-            price_change_pct_str = live_data.get('price_change_pct', '0.00')
-            try:
-                price_change_pct = float(price_change_pct_str)
-                price_change_str = f"{price_change_pct:.2f}%"
-            except (ValueError, TypeError):
-                price_change_str = "N/A"
-            print(f"Live Price: {live_data.get('price', 'N/A')} | 24h Change: {price_change_str}")
-        print(f"Total Worth: ${total_worth:.2f} | Initial Worth: ${initial_worth:.2f}")
+        print("="*80)
+        print(f"SYMBOL: {symbol} | Live Price: ${live_data.get('price', 'N/A')} | 24h Change: {live_data.get('price_change_pct', 'N/A')}% ")
         profit = total_worth - initial_worth
         profit_pct = (profit / initial_worth * 100) if initial_worth > 0 else 0
-        print(f"Profit/Loss: ${profit:.2f} ({profit_pct:.2f}%)")
-        print("-"*50)
+        print(f"Total Worth: ${total_worth:.2f} | P/L: ${profit:.2f} ({profit_pct:.2f}%)")
         print(wallet_info['text'])
+        print(f"--- SENTIMENT & ORDER BOOK ---\n{sentiment}\n{order_book}\n")
         print(market_summary)
-        print("-"*50)
-        print(f"AI DECISION: [{decision}]")
-        print(f"REASONING: {reasoning}")
-        print(f"PERSONA: {persona} | QUANTITY: {quantity*100:.0f}%")
-        print("="*50)
+        
+        # AI decision is printed separately in run_trading_cycle if it runs
         
         if trade_history:
             print("\n--- RECENT TRADES ---")
             for trade in reversed(trade_history[-5:]):
-                print(f"{trade['time']} | {trade['type']} | Amount: ${trade['amount']:.2f} @ Price: {trade['price']:.2f}")
-            print("---"*7)
+                print(f"{trade['time']} | {trade['type']:<4} | Amount: ${trade['amount']:<10.2f} @ Price: ${trade['price']:.2f}")
+            print("-" * 80)
 
     except Exception as e:
         print(f"Error printing status update: {e}")
-
 
 def run_trading_cycle(force_brain=False):
     global last_brain_run, current_decision, current_reasoning, current_persona, current_quantity, initial_worth
@@ -487,43 +479,64 @@ def run_trading_cycle(force_brain=False):
     symbol = os.getenv('SYMBOL', 'BTCUSDT')
     client = get_binance_client()
     
-    # 1. ALWAYS Get live data (Fast)
+    # 1. Fetch all data first
     live_data = get_live_ticker(client, symbol)
     wallet_info = get_wallet_info(client, symbol)
+    if initial_worth is None: initial_worth = float(wallet_info.get('total_usd', 0))
     
-    if initial_worth is None:
-        initial_worth = float(wallet_info.get('total_usd', 0))
+    market_summary, market_analysis_data = get_multi_timeframe_analysis(client, symbol)
+    order_book = get_order_book_snapshot(client, symbol)
+    sentiment = f"Fear & Greed Index: {get_fear_and_greed_index()}"
     
-    # 2. Extract Market Summary
-    market_summary = get_market_summary(client, symbol)
-    
-    # 3. THROTTLE: AI Brain every 12s
+    # 2. Print the current state BEFORE making a decision
+    print_status_update(market_summary, wallet_info, current_decision, current_reasoning, current_persona, current_quantity, live_data, order_book, sentiment)
+
+    # 3. Decide if it's time for the brain to run
     current_time = time.time()
     if force_brain or (current_time - last_brain_run) >= BRAIN_INTERVAL_SECONDS:
         print(f"\n--- BRAIN RE-EVALUATION ({time.strftime('%H:%M:%S')}) ---")
-        decision, reasoning, persona, quantity = ask_ai_opinion(market_summary, wallet_info['text'])
+        decision, reasoning, persona, quantity = ask_ai_opinion(market_summary, wallet_info['text'], trade_history, order_book, sentiment, live_data)
         
-        current_decision = decision
-        current_reasoning = reasoning
-        current_persona = persona
-        current_quantity = quantity
+        # --- GUARDRAILS & DYNAMIC RISK ---
+        usdt_balance = next((b['free'] for b in wallet_info.get('balances', []) if b['asset'] == 'USDT'), 0.0)
+        base_asset_balance = next((b['free'] for b in wallet_info.get('balances', []) if b['asset'] == symbol.replace('USDT', '')), 0.0)
+
+        if decision == "BUY":
+            if usdt_balance < 10.0:
+                print(f"!!! AI OVERRIDE: Insufficient USDT for minimum trade. Forcing HOLD. !!!", flush=True)
+                decision = "HOLD"
+            else: # Dynamic Risk Scaling
+                if market_analysis_data.get('15m', {}).get('rsi', 50) > 75:
+                    print(f"!!! RISK SCALING: 15m RSI is over 75 (overbought). Reducing quantity. !!!", flush=True)
+                    quantity = min(quantity, 0.1) # Cap quantity at 10%
+
+        if decision == "SELL" and base_asset_balance <= 0:
+            print(f"!!! AI OVERRIDE: Zero asset balance to sell. Forcing HOLD. !!!", flush=True)
+            decision = "HOLD"
+        # --- END GUARDRAILS ---
+
+        # Print the AI's thoughts and final decision
+        print("\n" + "-"*80)
+        print("--- AI ANALYSIS & DECISION ---")
+        print(f"{reasoning}")
+        print(f"\nFINAL DECISION: [{decision}] | QUANTITY: {quantity*100:.0f}%")
+        print("-" * 80)
+
+        current_decision, current_reasoning, current_persona, current_quantity = decision, reasoning, persona, quantity
         last_brain_run = current_time
         
         if current_decision != "HOLD":
             execute_trade(client, symbol, current_decision, current_quantity)
     
-    # 4. Print status update to terminal
-    print_status_update(market_summary, wallet_info, current_decision, current_reasoning, current_persona, current_quantity, live_data)
+
 
 def main_loop():
-    print("Starting AI Trading Terminal V4.0 (Terminal Mode)...", flush=True)
+    print("Starting AI Trading Terminal V5.1 (Synchronized Logging)...", flush=True)
 
-    # Status check (can be slow)
     if not check_ollama_status():
         print("\nAborting: Ollama is not ready.", flush=True)
         return
 
-    # Initial run
     run_trading_cycle(force_brain=True)
     
     while True:
@@ -532,7 +545,7 @@ def main_loop():
         except Exception as e:
             print(f"Loop Error: {e}", flush=True)
         
-        time.sleep(2) # 2s price update interval
+        time.sleep(2)
 
 if __name__ == "__main__":
     main_loop()
