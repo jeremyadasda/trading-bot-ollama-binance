@@ -19,11 +19,34 @@ services:
       - trading_net
     restart: unless-stopped
 
+  # --- BASE DE DATOS: PostgreSQL ---
+  db:
+    image: postgres:15-alpine
+    container_name: trading_db
+    environment:
+      POSTGRES_DB: ${DB_NAME:-trading_data}
+      POSTGRES_USER: ${DB_USER:-trader}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-secure_password}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    networks:
+      - trading_net
+    restart: unless-stopped
+    healthcheck: # Add healthcheck here
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s # Give it a bit more time to start
+
   # --- EJECUTOR: Tu Bot de Python ---
   trading_bot:
     build: .
     depends_on:
-      - ollama
+      ollama:
+        condition: service_started
+      db: # Update db dependency to wait for its healthcheck
+        condition: service_healthy
     dns:
       - 8.8.8.8
     environment:
@@ -31,6 +54,8 @@ services:
       - BINANCE_API_SECRET=${BINANCE_API_SECRET}
       - SYMBOL=${SYMBOL:-BTCUSDT}
       - OLLAMA_BASE_URL=http://ollama:11434
+      # Database connection string for the bot
+      - DATABASE_URL=postgresql://${DB_USER:-trader}:${DB_PASSWORD:-secure_password}@db:5432/${DB_NAME:-trading_data}
     volumes:
       - ./bot_logic:/app/bot_logic
       - trading_data:/app/shared
@@ -46,3 +71,4 @@ networks:
 volumes:
   ollama_storage:
   trading_data:
+  db_data: # Define the new volume for database persistence

@@ -1,7 +1,6 @@
-python-binance
+python-binance>=1.0.15
 pandas-ta
-python-binance
 python-dotenv
 websockets
 pandas
-pandas-ta
+psycopg2-binary
