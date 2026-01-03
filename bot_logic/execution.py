@@ -1,5 +1,6 @@
 import math
 import traceback
+from decimal import Decimal
 from binance.enums import *
 
 class TradeExecutor:
@@ -9,22 +10,30 @@ class TradeExecutor:
     def _get_lot_size_precision(self, step_size_str: str) -> int:
         return len(step_size_str.split('.')[1].split('1')[0]) if '.' in step_size_str else 0
 
-    def _format_quantity(self, quantity: float, precision: int) -> float:
+    def _format_quantity(self, quantity: float, step_size: float) -> float:
+        if step_size <= 0: return quantity
+        precision = int(-math.log10(step_size)) if step_size < 1 else 0
         factor = 10**precision
-        return math.floor(quantity * factor) / factor
+        # Use precision to avoid floating point garbage, then modulo to align with stepSize
+        qty = math.floor(quantity * factor) / factor
+        return float(Decimal(str(qty)) - (Decimal(str(qty)) % Decimal(str(step_size))))
 
     def _get_symbol_rules(self, symbol):
-        """Fetch LOT_SIZE and NOTIONAL rules for a symbol."""
+        """Fetch LOT_SIZE, MARKET_LOT_SIZE and NOTIONAL rules for a symbol."""
         try:
             info = self.client.get_symbol_info(symbol)
             if not info: return None
             
             lot_filter = next((f for f in info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
+            market_lot_filter = next((f for f in info['filters'] if f['filterType'] == 'MARKET_LOT_SIZE'), lot_filter)
             notional_filter = next((f for f in info['filters'] if f['filterType'] in ['NOTIONAL', 'MIN_NOTIONAL']), None)
             
             rules = {
                 'precision': self._get_lot_size_precision(lot_filter['stepSize']) if lot_filter else 8,
+                'step_size': float(lot_filter['stepSize']) if lot_filter else 0.00000001,
+                'market_step_size': float(market_lot_filter['stepSize']) if market_lot_filter else 0.00000001,
                 'min_qty': float(lot_filter['minQty']) if lot_filter else 0.0,
+                'max_qty': float(market_lot_filter['maxQty']) if market_lot_filter else 10000000.0,
                 'min_notional': float(notional_filter.get('minNotional', notional_filter.get('notional', 5.5))) if notional_filter else 5.5
             }
             return rules
@@ -119,12 +128,15 @@ class TradeExecutor:
 
             total_usd = 0
             detailed_balances = []
+            # Extended stablecoins for calculation
+            stable_assets = {'USDT', 'BUSD', 'USDC', 'TUSD', 'FDUSD', 'DAI'}
+            
             for asset, balance in filtered_balances_for_display.items():
-                price = 1.0 if asset in ['USDT', 'BUSD', 'USDC', 'TUSD'] else prices.get(f"{asset}USDT", 0)
+                price = 1.0 if asset in stable_assets else prices.get(f"{asset}USDT", 0)
                 usd_val = balance * price
                 if usd_val > 0.01:
-                    total_usd += usd_val
-                detailed_balances.append({"asset": asset, "balance": balance, "usd_value": usd_val, "price": price})
+                    total_usd += float(usd_val)
+                detailed_balances.append({"asset": asset, "balance": float(balance), "usd_value": float(usd_val), "price": float(price)})
 
             text = f"--- REAL PORTFOLIO (TRACKED ASSETS) ---\nTOTAL WORTH: ${total_usd:.2f} USD\n"
             for item in sorted(detailed_balances, key=lambda x: x['usd_value'], reverse=True):
@@ -143,6 +155,25 @@ class TradeExecutor:
         except Exception as e:
             print(f"Error fetching real wallet: {e}")
             return { "balances": [], "total_usd": 0.0, "trading_pair_worth": {}, "text": f"WALLET ERROR: {e}", "detailed_balances_list": [] }
+
+    def calculate_kelly_size(self, ml_score, win_loss_ratio=1.0):
+        """
+        Calculates the optimal trade size using the Kelly Criterion.
+        f* = (p*b - q) / b
+        where p = winning_probability (ML Score), b = win_loss_ratio, q = 1-p
+        We use a 'Half-Kelly' (f* / 2) approach for safety.
+        """
+        p = ml_score
+        b = win_loss_ratio
+        q = 1 - p
+        
+        if b <= 0: return 0.0 # Avoid division by zero
+        
+        kelly_f = (p * b - q) / b
+        
+        # We apply Half-Kelly and cap between 0 and 1.0 (Full Portfolio)
+        half_kelly = max(0.0, min(1.0, kelly_f / 2))
+        return half_kelly
 
     def prepare_real_wallet_for_clean_run(self, tracked_symbols):
         if not self.client:
@@ -197,7 +228,7 @@ class TradeExecutor:
         print("--- WALLET PREPARATION FINISHED ---")
 
     def liquidate_symbol(self, symbol):
-        """Liquidates the ENTIRE balance of a symbol into USDT. Returns trade_info dict."""
+        """Liquidates the balance of a symbol into USDT. Handles order splitting for large amounts."""
         if not self.client: return None
         asset = symbol.replace('USDT', '')
         try:
@@ -214,23 +245,54 @@ class TradeExecutor:
                 print(f"Skipping {asset}: Value ${usdt_val:.2f} < Min Notional ${rules['min_notional']:.2f}")
                 return None
 
-            qty = self._format_quantity(balance, rules['precision'])
-            if qty < rules['min_qty']:
-                print(f"Skipping {asset}: Qty {qty} < Min Qty {rules['min_qty']}")
+            full_qty = self._format_quantity(balance, rules['market_step_size'])
+            if full_qty < rules['min_qty']:
+                print(f"Skipping {asset}: Qty {full_qty} < Min Qty {rules['min_qty']}")
                 return None
 
-            print(f"Liquidating {qty} {asset}...")
-            order = self.client.create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_MARKET, quantity=qty)
+            # Handle order splitting if quantity exceeds max_qty
+            max_order_qty = rules['max_qty']
+            # Align max_order_qty to market_step_size
+            max_order_qty = self._format_quantity(max_order_qty, rules['market_step_size'])
             
-            print(f"Liquidation Success: {order['orderId']}")
-            return {
-                'action': "SELL", 
-                'amount': qty, 
-                'price': price, 
-                'orderId': order['orderId'], 
-                'currency': asset,
-                'usdt_amount': qty * price
-            }
+            remaining_qty = full_qty
+            last_order = None
+            
+            print(f"Liquidating {full_qty} {asset} (Aligned Max: {max_order_qty}, Step: {rules['market_step_size']})...")
+            
+            while remaining_qty >= rules['min_qty']:
+                qty_to_sell = min(remaining_qty, max_order_qty)
+                # Re-format just in case
+                qty_to_sell = self._format_quantity(qty_to_sell, rules['market_step_size'])
+
+                if qty_to_sell < rules['min_qty']: break
+                
+                # Ensure it still meets min_notional if it's a partial chunk
+                if (qty_to_sell * price) < rules['min_notional'] and remaining_qty != full_qty:
+                    break
+                    
+                order = self.client.create_order(
+                    symbol=symbol, 
+                    side=SIDE_SELL, 
+                    type=ORDER_TYPE_MARKET, 
+                    quantity=qty_to_sell
+                )
+                print(f"Chunk Sold ({qty_to_sell} {asset}): {order['orderId']}")
+                last_order = order
+                remaining_qty -= qty_to_sell
+                
+                if remaining_qty < rules['min_qty']:
+                    break
+            
+            if last_order:
+                return {
+                    'action': "SELL", 
+                    'amount': full_qty, 
+                    'price': price, 
+                    'orderId': last_order['orderId'], 
+                    'currency': asset,
+                    'usdt_amount': full_qty * price
+                }
         except Exception as e:
             print(f"Error liquidating {symbol}: {e}")
         return None

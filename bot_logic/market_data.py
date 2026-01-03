@@ -216,6 +216,52 @@ class MarketDataHandler:
                 
         return full_summary, analysis_data
 
+    def get_ml_features(self, symbol, interval=Client.KLINE_INTERVAL_1HOUR, limit=500):
+        """Generates a technical feature set for ML models."""
+        try:
+            klines = self.client.get_klines(symbol=symbol, interval=interval, limit=limit)
+            if not klines: return None
+            
+            df = pd.DataFrame(klines, columns=['ts', 'open', 'high', 'low', 'close', 'vol', 'close_ts', 'qav', 'num_trades', 'taker_base', 'taker_quote', 'ignore'])
+            df[['open', 'high', 'low', 'close', 'vol']] = df[['open', 'high', 'low', 'close', 'vol']].astype(float)
+            
+            # 1. Technical Indicators
+            df['RSI'] = ta.rsi(df['close'], length=14)
+            df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+            
+            # MACD
+            macd = ta.macd(df['close'])
+            df = pd.concat([df, macd], axis=1)
+            
+            # Bollinger Bands
+            bbands = ta.bbands(df['close'], length=20, std=2)
+            df = pd.concat([df, bbands], axis=1)
+            
+            # EMAs
+            df['EMA_20'] = ta.ema(df['close'], length=20)
+            df['EMA_50'] = ta.ema(df['close'], length=50)
+            df['EMA_200'] = ta.ema(df['close'], length=200)
+            
+            # 2. Percentage Changes (Momentum)
+            df['roc_1'] = df['close'].pct_change(1)
+            df['roc_5'] = df['close'].pct_change(5)
+            df['roc_10'] = df['close'].pct_change(10)
+            
+            # 3. Volatility (Rolling Std)
+            df['volatility_20'] = df['roc_1'].rolling(20).std()
+            
+            # 4. Target Labeling (For Training Fallback)
+            # Future return over next 4 candles (e.g. 4 hours if interval is 1h)
+            df['target_return'] = df['close'].shift(-4) / df['close'] - 1
+            df['target'] = (df['target_return'] > 0.01).astype(int) # 1 if > 1% gain
+            
+            # Clean up NaNs
+            df = df.dropna()
+            return df
+        except Exception as e:
+            print(f"Error generating ML features for {symbol}: {e}")
+            return None
+
     def get_order_book_snapshot(self, symbol):
         if not self.client: return "Order book data unavailable"
         try:

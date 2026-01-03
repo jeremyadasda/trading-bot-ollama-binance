@@ -78,8 +78,8 @@ class AIStrategy:
         except Exception as e:
             print(f"Could not update Knowledge Base: {e}")
 
-    def ask_ai_opinion(self, current_tracked_symbols, market_summary, full_wallet_info, order_book, live_data, trade_summary):
-        # ... (rest of the function setup)
+    def ask_ai_opinion(self, current_tracked_symbols, market_summary, full_wallet_info, order_book, live_data, trade_summary, ml_score=0.5, thought_buffer=None, sentiment_score=0.0):
+        # ... (rest of the setup logic remains same)
         wallet_text = full_wallet_info.get('text', '')
         usdt_balance = next((float(b['free']) for b in full_wallet_info.get('balances', []) if b['asset'] == 'USDT'), 0.0)
         total_portfolio_worth = full_wallet_info.get('total_usd', 0.0)
@@ -96,6 +96,19 @@ class AIStrategy:
                 knowledge_base = f.read()
         except Exception:
             knowledge_base = "Knowledge base file not found. Using default strategies."
+
+        # Format Scores
+        ml_insight = f"ML Statistical Confidence: {ml_score*100:.1f}% "
+        sent_insight = "BULLISH" if sentiment_score > 0.3 else "BEARISH" if sentiment_score < -0.3 else "NEUTRAL"
+        sent_val = f"{sentiment_score:+.2f} ({sent_insight})"
+
+        # Recursive Prompt Buffer Injection
+        recursive_history = ""
+        if thought_buffer and len(thought_buffer) > 0:
+            recursive_history = "\n--- RECURSIVE REASONING CHAIN (PREVIOUS CYCLES) ---\n"
+            for i, thought in enumerate(thought_buffer):
+                recursive_history += f"Cycle {i+1}: {thought}\n"
+            recursive_history += "\nCRITICAL: Use your previous thoughts to refine or pivot your final decision. Do not ignore them.\n"
 
         prompt = f"""
     ROLE: You are a sophisticated crypto trading analyst. Your goal is to maximize profit.
@@ -114,31 +127,44 @@ class AIStrategy:
     
     {trade_summary}
 
-    2. TECHNICAL ANALYSIS:
+    2. TECHNICAL ANALYSIS (ML + Structural):
     {market_summary}
     Live Price: {live_data.get('price', 'N/A')}
     Order Book: {order_book}
+    ---
+    HYBRID INTELLIGENCE:
+    [ML MODEL SCORE]: {ml_insight}
+    [SENTIMENT SCORE]: {sent_val} (Range -1 to +1)
+    
+    Note: Weight statistical and sentiment scores against your structural analysis.
+
+    {recursive_history}
 
     --- REASONING PROCESS (Chain-of-Thought) ---
     1.  **Assess Portfolio & Market:** Analyze market conditions and your portfolio.
-    2.  **Assess Current Symbol:** Select a strategy.
-    3.  **Self-Correction:** If you see a pattern that contradicts the Knowledge Base or requires a new rule, formulate a "Knowledge Update".
-    4.  **Final Decision:** State your decision.
+    2.  **Evaluate Current Symbol:** Using data streams, determine if this is a strong setup.
+    3.  **Cross-Check:** Compare ML Score and Sentiment with Structural Analysis.
+    4.  **Meta-Review:** If you have previous thoughts, how have the new data points changed your outlook?
+    5.  **Final Verdict:** Decide on an action and quantity.
 
-    --- RESPONSE FORMAT (JSON ONLY) ---
+    RESPONSE FORMAT (JSON ONLY):
     {{
       "reasoning": "Your analysis...",
       "decision": "BUY",
       "quantity_pct": 0.0,
+      "thinking_cycles_requested": 0,
       "knowledge_update": "A single, specific new insight or strategy you've learned. If NO new insight, use null.",
       "add_symbols": ["SOLUSDT"],
       "remove_symbols": [] 
     }}
     
+    DEEP THINKING RULE:
+    If you are unsure or want to observe more data before acting, set "thinking_cycles_requested" to 1-5 (each is 12s). 
+    
     IMPORTANT: Do NOT include placeholders like 'Optional' or 'Optional material' in the knowledge_update. If you have nothing new to add, the field MUST be null.
     """
         
-        print(f"Running multi-dimensional analysis with {self.model_name}...")
+        print(f"Running hybrid analysis with {self.model_name}...")
         try:
             payload = {
                 "model": self.model_name, "prompt": prompt, "stream": False, "format": "json",
@@ -152,23 +178,60 @@ class AIStrategy:
 
             decision = (data_json.get('decision') or 'HOLD').upper()
             
-            # Robust quantity parsing (handles null or missing)
+            # Robust quantity parsing
             raw_qty = data_json.get('quantity_pct')
             quantity = float(raw_qty) if raw_qty is not None else 0.0
             
             reasoning = data_json.get('reasoning') or 'No reasoning provided.'
             kb_update = data_json.get('knowledge_update')
             
-            # Extract symbol recommendations (handles null or missing)
             raw_add = data_json.get('add_symbols')
             add_syms = raw_add if isinstance(raw_add, list) else []
             
             raw_remove = data_json.get('remove_symbols')
             remove_syms = raw_remove if isinstance(raw_remove, list) else []
 
-            return decision, reasoning, quantity, add_syms, remove_syms, kb_update
+            thinking_cycles = int(data_json.get('thinking_cycles_requested', 0))
+            thinking_cycles = max(0, min(5, thinking_cycles))
+
+            return decision, reasoning, quantity, add_syms, remove_syms, kb_update, thinking_cycles
             
         except Exception as e:
             print(f"ERROR: AI Brain failed to regulate: {e}")
             traceback.print_exc()
-            return "HOLD", str(e), 0.0, [], [], None
+            return "HOLD", str(e), 0.0, [], [], None, 0
+
+    def get_sentiment_score(self, symbol, headlines):
+        """Asks AI to score the sentiment of a list of headlines."""
+        prompt = f"""
+    ROLE: Financial Sentiment Analyst.
+    TASK: Analyze the following headlines for {symbol} and provide a sentiment score.
+    
+    HEADLINES:
+    {headlines}
+    
+    RULES:
+    1. Score must be between -1.0 (Extreme Bearish/Fear) and +1.0 (Extreme Bullish/Greed).
+    2. 0.0 is Neutral.
+    3. Return ONLY the number. No text.
+    
+    SCORE:
+    """
+        try:
+            payload = {
+                "model": self.model_name, "prompt": prompt, "stream": False,
+                "options": { "temperature": 0.0, "num_predict": 10 }
+            }
+            r = requests.post(self.generate_url, json=payload, timeout=30)
+            r.raise_for_status()
+            
+            score_text = r.json().get('response', '0.0').strip()
+            # Extract only the first number found
+            import re
+            match = re.search(r"(-?\d+\.?\d*)", score_text)
+            if match:
+                return float(match.group(1))
+            return 0.0
+        except Exception as e:
+            print(f"Error scoring sentiment: {e}")
+            return 0.0

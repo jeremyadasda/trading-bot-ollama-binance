@@ -9,6 +9,38 @@ from database import DatabaseHandler
 from market_data import MarketDataHandler
 from strategy import AIStrategy
 from execution import TradeExecutor
+from ml_logic import MLPredictor
+from researcher import ResearchAgent
+from sentiment import SentimentSentinel
+
+LOCK_FILE = "shared/bot.lock"
+
+def acquire_lock():
+    """Try to acquire a lock file to prevent dual-execution."""
+    my_pid = os.getpid()
+    try:
+        if os.path.exists(LOCK_FILE):
+            with open(LOCK_FILE, 'r') as f:
+                content = f.read().strip()
+                if content:
+                    try:
+                        old_pid = int(content)
+                        if old_pid != my_pid:
+                            # Check if process is still alive
+                            os.kill(old_pid, 0)
+                            print(f"ABORT: Bot is already running (PID {old_pid}). Close the other process first.")
+                            return False
+                    except (ValueError, OSError):
+                        print("Stale or invalid lock file found. Overwriting...")
+        
+        with open(LOCK_FILE, 'w') as f:
+            f.write(str(my_pid))
+        return True
+    except Exception as e:
+        print(f"Singleton lock error: {e}")
+        return True # Default to True to allow start if file system is weird
+
+
 
 # Load Env
 load_dotenv(find_dotenv())
@@ -70,6 +102,8 @@ def print_status_update(symbol, market_summary, wallet_info, ai_decision, ai_rea
         print(f"Error printing status update: {e}")
 
 def main_loop():
+    if not acquire_lock():
+        return
     print("Starting Modular AI Trading Terminal...", flush=True)
 
     # 1. Initialize DB
@@ -105,15 +139,25 @@ def main_loop():
     client = init_binance_client()
     market = MarketDataHandler(client)
     executor = TradeExecutor(client)
+    ml = MLPredictor()
+    researcher = ResearchAgent(ai)
+    sentinel = SentimentSentinel(ai)
 
     # Prepare Wallet for Clean Run (Liquidate and Reset to 200 USDT)
     if CLEAN_RUN_ENABLED:
         executor.prepare_real_wallet_for_clean_run(tracked_symbols)
 
     initial_worth = None
+    thinking_registry = {} # { symbol: { 'cycles_left': int, 'buffer': [] } }
+    cycle_count = 0
 
     while True:
         try:
+            cycle_count += 1
+            # Periodic Research Study Session (e.g., every 50 cycles)
+            if cycle_count % 50 == 0:
+                researcher.conduct_study_session()
+
             # Prune DB daily (simple check)
             # db.prune_database() # Optional, call strictly if needed
 
@@ -131,7 +175,6 @@ def main_loop():
             profit = total_worth - initial_worth
             profit_pct = (profit/initial_worth*100) if initial_worth else 0
 
-
             # A. Prepare Comprehensive Portfolio Data
             portfolio_summary = ""
             for s in current_tracked_symbols:
@@ -146,24 +189,70 @@ def main_loop():
                 live_data = market.get_live_ticker(symbol)
                 order_book = market.get_order_book_snapshot(symbol)
 
-                # C. AI Analysis (Now with full portfolio context)
-                decision, reasoning, quantity, add_syms, remove_syms, kb_update = ai.ask_ai_opinion(
-                    current_tracked_symbols, portfolio_summary, wallet_info, order_book, live_data, trades_summary
+                # B2. ML Confidence Score
+                ml_score = 0.5
+                df_ml = market.get_ml_features(symbol)
+                if df_ml is not None:
+                    # Auto-train if no model
+                    if ml.model is None:
+                        ml.train_on_data(df_ml)
+                    ml_score = float(ml.predict_confidence(df_ml))
+
+                # B2.1 Sentiment Score
+                sentiment_score = float(sentinel.analyze_symbol_sentiment(symbol))
+
+                # B3. Deep Thinking State Check
+                symbol_thinking = thinking_registry.get(symbol)
+                thought_buffer = symbol_thinking['buffer'] if symbol_thinking else []
+                
+                if symbol_thinking:
+                    print(f"SYMBOL {symbol} is currently THINKING... Cycle {len(thought_buffer)} of requested duration.")
+
+                # C. AI Analysis (Now with full portfolio context + ML Score + Thought Buffer + Sentiment)
+                decision, reasoning, quantity, add_syms, remove_syms, kb_update, thinking_cycles = ai.ask_ai_opinion(
+                    current_tracked_symbols, portfolio_summary, wallet_info, order_book, live_data, trades_summary, ml_score, thought_buffer, sentiment_score
                 )
                 
+                # C2. Handle Deep Thinking Cycle Logic
+                if thinking_cycles > 0 and len(thought_buffer) < thinking_cycles:
+                    # AI wants to think more. Store reasoning and skip execution.
+                    if not symbol_thinking:
+                        thinking_registry[symbol] = {'buffer': [reasoning]}
+                    else:
+                        thinking_registry[symbol]['buffer'].append(reasoning)
+                    
+                    print(f"DEEP THINKING: {symbol} requested {thinking_cycles} cycles. Buffer updated.")
+                    # Log as THINKING decision
+                    db.log_decision(symbol, "THINKING", 0.0, reasoning, None, wallet_info, {"thought_buffer": thinking_registry[symbol]['buffer']})
+                    continue # Skip to next symbol
+                
+                # If we were thinking and now we have a decision (cycles=0 or reached limit)
+                if symbol_thinking:
+                    print(f"DEEP THINKING COMPLETE: {symbol} has reached its decision after {len(thought_buffer)} cycles.")
+                    del thinking_registry[symbol]
+
                 if kb_update:
                     ai.update_knowledge_base(kb_update)
 
-                # C. Execution
+                # D2. Dynamic Portfolio Rebalancing (Kelly Criterion)
+                # If AI wants to BUY, we override/refine quantity based on ML Score (Statistical Probability)
+                if decision == "BUY":
+                    kelly_qty = float(executor.calculate_kelly_size(ml_score))
+                    print(f"KELLY OPTIMIZATION: ML Score {ml_score:.2f} -> Kelly Recommended Size: {kelly_qty*100:.1f}%")
+                    # We take a blend or the AI's cap if it's more conservative
+                    quantity = float(min(quantity, kelly_qty) if quantity > 0 else kelly_qty)
+                    reasoning += f"\n[Kelly Optimization]: Adjusting size to {quantity*100:.1f}% based on statistical confidence."
+
+                # D. Execution
                 trade_info = executor.execute_trade(symbol, decision, quantity)
 
-                # D. Logging
+                # E. Logging
                 if trade_info:
                     # Update wallet if trade happened
                     wallet_info = executor.get_wallet_info(current_tracked_symbols)
 
                 # Log decision first to ensure DB is up to date
-                db.log_decision(symbol, decision, quantity, reasoning, trade_info, wallet_info, {})
+                db.log_decision(symbol, decision, quantity, reasoning, trade_info, wallet_info, {"thought_buffer": thought_buffer})
 
                 # If a trade occurred, refresh the summary so it appears in the status immediately
                 if trade_info:

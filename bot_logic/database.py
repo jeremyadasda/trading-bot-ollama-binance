@@ -141,9 +141,9 @@ class DatabaseHandler:
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
                 ''', (
-                    symbol, ai_decision, ai_quantity_pct, ai_reasoning,
-                    trade_info.get('action', 'NONE'), trade_info.get('amount', 0.0), trade_info.get('price', 0.0),
-                    usdt_balance, asset_balance, wallet_info.get('total_usd', 0.0),
+                    symbol, ai_decision, float(ai_quantity_pct), ai_reasoning,
+                    trade_info.get('action', 'NONE'), float(trade_info.get('amount', 0.0)), float(trade_info.get('price', 0.0)),
+                    float(usdt_balance), float(asset_balance), float(wallet_info.get('total_usd', 0.0)),
                     context_str, str(trade_info.get('orderId', ''))
                 ))
                 return cur.fetchone()[0]
